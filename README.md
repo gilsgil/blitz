@@ -85,14 +85,6 @@ blitz can be used to scan a single target, a list of hosts, or an entire IP rang
 
 The tool outputs active hosts and open ports in the format: `hostname:port`. Domains that are behind CDNs are filtered out by default unless verbose mode is enabled.
 
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Feel free to contribute by submitting a pull request or opening an issue!
-
 ## Contact
 
 For any questions or feedback, feel free to reach out via email or open an issue on GitHub.
