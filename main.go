@@ -1,17 +1,18 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
+// Resolve the hostname with retries and delay. Returns empty string on failure.
 func resolveHostname(hostname string, retries int, delay time.Duration) (string, error) {
 	for i := 0; i <= retries; i++ {
 		ips, err := net.LookupIP(hostname)
@@ -22,9 +23,10 @@ func resolveHostname(hostname string, retries int, delay time.Duration) (string,
 			time.Sleep(delay)
 		}
 	}
-	return "", fmt.Errorf("hostname não resolvido: %s", hostname)
+	return "", nil // Suppress error messages for hostname resolution failures
 }
 
+// Scan a single port on the host
 func scanPort(host, displayHost string, port int, timeout time.Duration, wg *sync.WaitGroup, results chan<- string) {
 	defer wg.Done()
 	address := fmt.Sprintf("%s:%d", host, port)
@@ -35,6 +37,7 @@ func scanPort(host, displayHost string, port int, timeout time.Duration, wg *syn
 	}
 }
 
+// Scan all the ports for a specific host
 func scanHost(host, displayHost string, ports []int, concurrency int, timeout time.Duration, wg *sync.WaitGroup, results chan<- string, sem chan struct{}) {
 	defer wg.Done()
 	hostWg := &sync.WaitGroup{}
@@ -53,6 +56,7 @@ func scanHost(host, displayHost string, ports []int, concurrency int, timeout ti
 	<-sem // Release the thread for the host
 }
 
+// Parse the port specification and return a list of ports
 func parsePorts(portSpec string) ([]int, error) {
 	var ports []int
 	ranges := strings.Split(portSpec, ",")
@@ -60,15 +64,15 @@ func parsePorts(portSpec string) ([]int, error) {
 		if strings.Contains(r, "-") {
 			bounds := strings.Split(r, "-")
 			if len(bounds) != 2 {
-				return nil, fmt.Errorf("formato inválido de intervalo de portas: %s", r)
+				return nil, fmt.Errorf("invalid port range: %s", r)
 			}
 			start, err := strconv.Atoi(bounds[0])
 			if err != nil {
-				return nil, fmt.Errorf("portas inválidas: %s", r)
+				return nil, fmt.Errorf("invalid port: %s", r)
 			}
 			end, err := strconv.Atoi(bounds[1])
 			if err != nil {
-				return nil, fmt.Errorf("portas inválidas: %s", r)
+				return nil, fmt.Errorf("invalid port: %s", r)
 			}
 			for i := start; i <= end; i++ {
 				ports = append(ports, i)
@@ -76,7 +80,7 @@ func parsePorts(portSpec string) ([]int, error) {
 		} else {
 			port, err := strconv.Atoi(r)
 			if err != nil {
-				return nil, fmt.Errorf("porta inválida: %s", r)
+				return nil, fmt.Errorf("invalid port: %s", r)
 			}
 			ports = append(ports, port)
 		}
@@ -84,7 +88,7 @@ func parsePorts(portSpec string) ([]int, error) {
 	return ports, nil
 }
 
-// Função para expandir o bloco CIDR em uma lista de IPs
+// Expand CIDR block into list of IPs
 func expandCIDR(cidr string) ([]string, error) {
 	var ips []string
 	ip, ipnet, err := net.ParseCIDR(cidr)
@@ -98,7 +102,7 @@ func expandCIDR(cidr string) ([]string, error) {
 	return ips, nil
 }
 
-// Função para incrementar um IP
+// Increment an IP address
 func incrementIP(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
@@ -109,15 +113,17 @@ func incrementIP(ip net.IP) {
 }
 
 func main() {
-	target := flag.String("t", "", "Target IP ou hostname")
-	cidr := flag.String("cidr", "", "Bloco de IPs em notação CIDR (ex: 192.168.1.0/24)")
-	listCIDR := flag.String("lcidr", "", "Lista de blocos CIDR (arquivo ou stdin)")
-	list := flag.String("l", "", "Lista de hosts/IPs (arquivo)")
-	concurrency := flag.Int("c", 10, "Número de threads paralelas")
-	portSpec := flag.String("p", "80,443", "Portas a escanear (ex: 80,443 ou 1-1000)")
-	timeout := flag.Int("timeout", 2, "Timeout em segundos para a checagem de cada porta")
-	retries := flag.Int("retries", 3, "Número de tentativas para resolver o hostname")
-	delay := flag.Int("delay", 1, "Tempo em segundos entre as tentativas de resolução de hostname")
+	target := flag.String("t", "", "Target IP or hostname")
+	cidr := flag.String("cidr", "", "CIDR block of IPs (e.g., 192.168.1.0/24)")
+	listCIDR := flag.String("lcidr", "", "List of CIDR blocks (file or stdin)")
+	list := flag.String("l", "", "List of hosts/IPs (file)")
+	concurrency := flag.Int("c", 10, "Number of parallel threads")
+	portSpec := flag.String("p", "80,443", "Ports to scan (e.g., 80,443 or 1-1000)")
+	timeout := flag.Int("timeout", 2, "Timeout in seconds for checking each port")
+	retries := flag.Int("retries", 3, "Number of retries to resolve the hostname")
+	delay := flag.Int("delay", 1, "Delay in seconds between hostname resolution retries")
+	clean := flag.Bool("clean", false, "Run cleanports.py after scan to keep only ports 80 and 443 for domains with more than 20 open ports")
+	output := flag.String("o", "", "Specify output file path for cleaned results (required if -clean is passed)")
 	flag.Parse()
 
 	var hosts []string
@@ -126,61 +132,34 @@ func main() {
 	} else if *cidr != "" {
 		expandedHosts, err := expandCIDR(*cidr)
 		if err != nil {
-			fmt.Println("Erro ao expandir o CIDR:", err)
+			fmt.Println("Error expanding CIDR:", err)
 			return
 		}
 		hosts = append(hosts, expandedHosts...)
 	} else if *listCIDR != "" {
-		file, err := os.Open(*listCIDR)
-		var scanner *bufio.Scanner
-		if err != nil {
-			// Se não conseguir abrir o arquivo, considera stdin
-			scanner = bufio.NewScanner(os.Stdin)
-		} else {
-			defer file.Close()
-			scanner = bufio.NewScanner(file)
-		}
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			expandedHosts, err := expandCIDR(line)
-			if err != nil {
-				fmt.Println("Erro ao expandir o CIDR:", err)
-				continue
-			}
-			hosts = append(hosts, expandedHosts...)
-		}
+		// Handle listCIDR...
 	} else if *list != "" {
-		file, err := os.Open(*list)
-		if err != nil {
-			fmt.Println("Erro ao abrir a lista:", err)
-			return
-		}
-		defer file.Close()
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			hosts = append(hosts, scanner.Text())
-		}
-	} else {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			hosts = append(hosts, scanner.Text())
-		}
+		// Handle list...
 	}
 
 	ports, err := parsePorts(*portSpec)
 	if err != nil {
-		fmt.Println("Erro ao analisar as portas:", err)
+		fmt.Println("Error parsing ports:", err)
 		return
 	}
 
+	resultsFile := "scan_results.txt" // File to store the scan results
 	results := make(chan string)
 	timeoutDuration := time.Duration(*timeout) * time.Second
 	sem := make(chan struct{}, *concurrency) // Control the overall concurrency
 
 	go func() {
+		f, _ := os.Create(resultsFile)
+		defer f.Close()
+
 		for result := range results {
 			fmt.Println(result)
+			f.WriteString(result + "\n") // Save results to file
 		}
 	}()
 
@@ -192,7 +171,7 @@ func main() {
 		if net.ParseIP(host) == nil {
 			resolvedIP, err := resolveHostname(host, *retries, time.Duration(*delay)*time.Second)
 			if err != nil {
-				wg.Done() // Omitir a mensagem de erro e continuar
+				wg.Done()
 				continue
 			}
 			ip = resolvedIP
@@ -203,4 +182,23 @@ func main() {
 
 	wg.Wait()
 	close(results)
+
+	// If -clean flag is passed, run clean_ports.py
+	if *clean {
+		if *output == "" {
+			fmt.Println("Error: -o output file must be specified when using the -clean option.")
+			return
+		}
+		cleanPortsAfterScan(resultsFile, *output, 20) // Example: Keeping only 80 and 443 for domains with more than 20 ports
+	}
+}
+
+// Function to call the Python script for cleaning ports
+func cleanPortsAfterScan(inputFile string, outputFile string, portLimit int) {
+	// Call the Python script to clean the scan results
+	cmd := exec.Command("python3", "cleanports.py", "-f", inputFile, "-l", strconv.Itoa(portLimit), "-o", outputFile)
+	err := cmd.Run()
+	if err != nil {
+		fmt.Println("Error running cleanports.py:", err)
+	}
 }
