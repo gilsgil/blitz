@@ -22,7 +22,7 @@
 ### Install with Go
 
 ```bash
-go install github.com/yourusername/blitz@latest
+go install github.com/gilsgil/blitz@latest
 ```
 
 This will install the latest version of `blitz` and make it available globally via the command line.
