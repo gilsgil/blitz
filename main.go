@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"net"
@@ -25,32 +26,88 @@ func resolveHostname(hostname string, retries int, delay time.Duration) (string,
 	return "", fmt.Errorf("hostname não resolvido: %s", hostname)
 }
 
-func scanPort(host, displayHost string, port int, timeout time.Duration, wg *sync.WaitGroup, results chan<- string) {
-	defer wg.Done()
-	address := fmt.Sprintf("%s:%d", host, port)
-	conn, err := net.DialTimeout("tcp", address, timeout)
-	if err == nil {
-		conn.Close()
-		results <- fmt.Sprintf("%s:%d", displayHost, port)
-	}
-}
-
 func scanHost(host, displayHost string, ports []int, concurrency int, timeout time.Duration, wg *sync.WaitGroup, results chan<- string, sem chan struct{}) {
 	defer wg.Done()
+
+	var mu sync.Mutex
+	var openPorts []int
+
+	// Criar um contexto para cancelar o scan se o número de portas abertas ultrapassar 30
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	hostWg := &sync.WaitGroup{}
 	semHost := make(chan struct{}, concurrency)
 
+	// Varredura das portas – se o contexto for cancelado, não dispara novas goroutines
+portLoop:
 	for _, port := range ports {
+		select {
+		case <-ctx.Done():
+			break portLoop
+		default:
+		}
+
 		hostWg.Add(1)
 		semHost <- struct{}{}
 		go func(port int) {
-			defer func() { <-semHost }()
-			scanPort(host, displayHost, port, timeout, hostWg, results)
+			defer func() {
+				<-semHost
+				hostWg.Done()
+			}()
+
+			// Se o contexto já estiver cancelado, encerra a goroutine
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			address := fmt.Sprintf("%s:%d", host, port)
+			conn, err := net.DialTimeout("tcp", address, timeout)
+			if err == nil {
+				conn.Close()
+				mu.Lock()
+				openPorts = append(openPorts, port)
+				// Se o número de portas abertas ultrapassar 30, cancela o scan do host
+				if len(openPorts) > 30 {
+					cancel()
+				}
+				mu.Unlock()
+			}
 		}(port)
 	}
 
 	hostWg.Wait()
-	<-sem // Release the thread for the host
+
+	// Se mais de 30 portas abertas foram encontradas, realiza scan apenas para 80 e 443
+	mu.Lock()
+	totalOpen := len(openPorts)
+	mu.Unlock()
+
+	if totalOpen > 30 {
+		var special []int
+		for _, port := range []int{80, 443} {
+			address := fmt.Sprintf("%s:%d", host, port)
+			conn, err := net.DialTimeout("tcp", address, timeout)
+			if err == nil {
+				conn.Close()
+				special = append(special, port)
+			}
+		}
+		for _, port := range special {
+			results <- fmt.Sprintf("%s:%d", displayHost, port)
+		}
+	} else {
+		mu.Lock()
+		for _, port := range openPorts {
+			results <- fmt.Sprintf("%s:%d", displayHost, port)
+		}
+		mu.Unlock()
+	}
+
+	// Libera a vaga do semáforo para o host
+	<-sem
 }
 
 func parsePorts(portSpec string) ([]int, error) {
@@ -132,7 +189,6 @@ func main() {
 		file, err := os.Open(*listCIDR)
 		var scanner *bufio.Scanner
 		if err != nil {
-			// Se não conseguir abrir o arquivo, considera stdin
 			scanner = bufio.NewScanner(os.Stdin)
 		} else {
 			defer file.Close()
@@ -164,13 +220,15 @@ func main() {
 
 	ports, err := parsePorts(*portSpec)
 	if err != nil {
+		fmt.Println(err)
 		return
 	}
 
 	results := make(chan string)
 	timeoutDuration := time.Duration(*timeout) * time.Second
-	sem := make(chan struct{}, *concurrency) // Control the overall concurrency
+	sem := make(chan struct{}, *concurrency) // Controla a concorrência global entre hosts
 
+	// Goroutine para imprimir os resultados
 	go func() {
 		for result := range results {
 			fmt.Println(result)
@@ -185,7 +243,7 @@ func main() {
 		if net.ParseIP(host) == nil {
 			resolvedIP, err := resolveHostname(host, *retries, time.Duration(*delay)*time.Second)
 			if err == nil {
-				if resolvedIP == "127.0.0.1" || resolvedIP == "127.0.0.2" || resolvedIP == "127.0.0.3" { // Ignorar hosts que resolvem para 127.0.0.1
+				if resolvedIP == "127.0.0.1" || resolvedIP == "127.0.0.2" || resolvedIP == "127.0.0.3" {
 					wg.Done()
 					continue
 				}
@@ -195,7 +253,7 @@ func main() {
 				continue
 			}
 		}
-		sem <- struct{}{} // Control the number of active hosts
+		sem <- struct{}{} // Controla o número de hosts ativos
 		go scanHost(ip, displayHost, ports, *concurrency, timeoutDuration, wg, results, sem)
 	}
 
